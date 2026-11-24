@@ -226,6 +226,8 @@ static bool generic_ops_supported(void)
 
 static int generic_ops_register(void)
 {
+	struct efivars_pdev_data pdata = { .registering = true };
+	struct efivars_pdev_data *pdev_data;
 	struct platform_device *pdev;
 	int ret;
 
@@ -251,14 +253,27 @@ static int generic_ops_register(void)
 	/*
 	 * Register the platform device only after efivars_register() has
 	 * returned, so that a consumer probing synchronously from
-	 * platform_device_register_simple() can take efivars_lock.
+	 * platform_device_register_data() can take efivars_lock.
 	 */
-	pdev = platform_device_register_simple("efivars", 0, NULL, 0);
-	if (IS_ERR(pdev))
+	pdev = platform_device_register_data(NULL, EFIVARS_PDEV_NAME, 0,
+					     &pdata, sizeof(pdata));
+	if (IS_ERR(pdev)) {
 		pr_warn("efi: failed to register efivars platform device: %pe\n",
 			pdev);
-	else
-		efivars_pdev = pdev;
+		return 0;
+	}
+
+	/*
+	 * Any probe performed automatically by the driver core as part of
+	 * registering the device has completed by now (for drivers that
+	 * probe synchronously). Clear the flag so that consumers can tell
+	 * such probes apart from later ones, e.g., explicit binds via sysfs.
+	 * The device is already visible in sysfs, so a concurrent probe on
+	 * another CPU may read the flag without serialization.
+	 */
+	pdev_data = dev_get_platdata(&pdev->dev);
+	WRITE_ONCE(pdev_data->registering, false);
+	efivars_pdev = pdev;
 
 	return 0;
 }

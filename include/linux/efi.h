@@ -1069,6 +1069,17 @@ struct efivars {
 	const struct efivar_operations *ops;
 };
 
+/*
+ * The "efivars" platform device is registered while the generic, EFI runtime
+ * services based efivars ops are registered and support SetVariable().
+ */
+#define EFIVARS_PDEV_NAME	"efivars"
+
+struct efivars_pdev_data {
+	/* true only while platform_device_register_data() is in progress */
+	bool registering;
+};
+
 #ifdef CONFIG_X86
 u64 __attribute_const__ efivar_reserved_space(void);
 #else
