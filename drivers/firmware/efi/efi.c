@@ -31,6 +31,7 @@
 #include <linux/acpi.h>
 #include <linux/ucs2_string.h>
 #include <linux/memblock.h>
+#include <linux/mutex.h>
 #include <linux/security.h>
 #include <linux/notifier.h>
 
@@ -188,6 +189,21 @@ EXPORT_SYMBOL_GPL(efivar_ops_nh);
 static struct efivars generic_efivars;
 static struct efivar_operations generic_ops;
 
+/*
+ * Serializes generic_ops_register() and generic_ops_unregister(), which may
+ * also be called at runtime via efivars_generic_ops_[un]register(), and
+ * protects efivars_pdev.
+ */
+static DEFINE_MUTEX(generic_ops_lock);
+
+/*
+ * The "efivars" platform device that efi-pstore binds to. It only exists
+ * while the generic, EFI runtime services based efivars ops are registered
+ * and support SetVariable(), as other efivars implementations may not
+ * provide a SetVariable() that is safe to call from the pstore dump path.
+ */
+static struct platform_device *efivars_pdev;
+
 static bool generic_ops_supported(void)
 {
 	unsigned long name_size;
@@ -208,6 +224,13 @@ static bool generic_ops_supported(void)
 
 static int generic_ops_register(void)
 {
+	struct efivars_pdev_data pdata = { .registering = true };
+	struct efivars_pdev_data *pdev_data;
+	struct platform_device *pdev;
+	int ret;
+
+	guard(mutex)(&generic_ops_lock);
+
 	if (!generic_ops_supported())
 		return 0;
 
@@ -220,13 +243,54 @@ static int generic_ops_register(void)
 		generic_ops.set_variable = efi.set_variable;
 		generic_ops.set_variable_nonblocking = efi.set_variable_nonblocking;
 	}
-	return efivars_register(&generic_efivars, &generic_ops);
+
+	ret = efivars_register(&generic_efivars, &generic_ops);
+	if (ret || !generic_ops.set_variable)
+		return ret;
+
+	/*
+	 * Register the platform device only after efivars_register() has
+	 * returned, so that a consumer probing synchronously from
+	 * platform_device_register_data() can take efivars_lock.
+	 */
+	pdev = platform_device_register_data(NULL, EFIVARS_PDEV_NAME, 0,
+					     &pdata, sizeof(pdata));
+	if (IS_ERR(pdev)) {
+		pr_warn("efi: failed to register efivars platform device: %pe\n",
+			pdev);
+		return 0;
+	}
+
+	/*
+	 * Any probe performed automatically by the driver core as part of
+	 * registering the device has completed by now (for drivers that
+	 * probe synchronously). Clear the flag so that consumers can tell
+	 * such probes apart from later ones, e.g., explicit binds via sysfs.
+	 * The device is already visible in sysfs, so a concurrent probe on
+	 * another CPU may read the flag without serialization.
+	 */
+	pdev_data = dev_get_platdata(&pdev->dev);
+	WRITE_ONCE(pdev_data->registering, false);
+	efivars_pdev = pdev;
+
+	return 0;
 }
 
 static void generic_ops_unregister(void)
 {
+	guard(mutex)(&generic_ops_lock);
+
 	if (!generic_ops.get_variable)
 		return;
+
+	/*
+	 * Unregister the platform device first, so that consumers are
+	 * detached while the efivars ops they rely on are still registered.
+	 */
+	if (efivars_pdev) {
+		platform_device_unregister(efivars_pdev);
+		efivars_pdev = NULL;
+	}
 
 	efivars_unregister(&generic_efivars);
 }
@@ -481,7 +545,6 @@ static int __init efisubsys_init(void)
 		error = efivar_ssdt_load();
 		if (error)
 			pr_err("efi: failed to load SSDT, error %d.\n", error);
-		platform_device_register_simple("efivars", 0, NULL, 0);
 	}
 
 	BLOCKING_INIT_NOTIFIER_HEAD(&efivar_ops_nh);

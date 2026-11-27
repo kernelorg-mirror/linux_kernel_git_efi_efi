@@ -2,8 +2,10 @@
 
 #include <linux/efi.h>
 #include <linux/module.h>
+#include <linux/platform_device.h>
 #include <linux/pstore.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 #include <linux/ucs2_string.h>
 
 MODULE_IMPORT_NS("EFIVAR");
@@ -19,37 +21,11 @@ MODULE_PARM_DESC(record_size, "size of each pstore UEFI var (in bytes, min/defau
 	 EFI_VARIABLE_BOOTSERVICE_ACCESS | \
 	 EFI_VARIABLE_RUNTIME_ACCESS)
 
-static bool pstore_disable = IS_ENABLED(CONFIG_EFI_VARS_PSTORE_DEFAULT_DISABLE);
+static bool efivars_pstore_disable =
+	IS_ENABLED(CONFIG_EFI_VARS_PSTORE_DEFAULT_DISABLE);
+static bool efi_pstore_driver_registering;
 
-static int efivars_pstore_init(void);
-static void efivars_pstore_exit(void);
-
-static int efi_pstore_disable_set(const char *val, const struct kernel_param *kp)
-{
-	int err;
-	bool old_pstore_disable = pstore_disable;
-
-	err = param_set_bool(val, kp);
-	if (err)
-		return err;
-
-	if (old_pstore_disable != pstore_disable) {
-		if (pstore_disable)
-			efivars_pstore_exit();
-		else
-			efivars_pstore_init();
-	}
-
-	return 0;
-}
-
-static const struct kernel_param_ops pstore_disable_ops = {
-	.set	= efi_pstore_disable_set,
-	.get	= param_get_bool,
-};
-
-module_param_cb(pstore_disable, &pstore_disable_ops, &pstore_disable, 0644);
-__MODULE_PARM_TYPE(pstore_disable, "bool");
+module_param_named(pstore_disable, efivars_pstore_disable, bool, 0444);
 
 static int efi_pstore_open(struct pstore_info *psi)
 {
@@ -255,13 +231,42 @@ static struct pstore_info efi_pstore_info = {
 	.erase		= efi_pstore_erase,
 };
 
-static int efivars_pstore_init(void)
+static int efi_pstore_probe(struct platform_device *pdev)
 {
-	if (!efivar_supports_writes())
-		return 0;
+	const struct efivars_pdev_data *pdata = dev_get_platdata(&pdev->dev);
+	int ret;
 
-	if (pstore_disable)
-		return 0;
+	/*
+	 * efi_pstore_info is a singleton, so only bind to the "efivars" device
+	 * registered by the EFI core, of which at most one exists at any given
+	 * time, and whose probe and remove are serialized by its device_lock.
+	 * This also rejects other devices whose driver_override was set to
+	 * "efi-pstore" via sysfs, which platform_match() honours before
+	 * consulting the id table.
+	 */
+	if (!pdata || strcmp(pdev->name, EFIVARS_PDEV_NAME))
+		return -ENODEV;
+
+	if (!efivar_supports_writes())
+		return -ENODEV;
+
+	/*
+	 * If efi-pstore is disabled, only permit binding it explicitly via
+	 * sysfs, by refusing the probes that the driver core performs
+	 * automatically when the driver or the "efivars" device is
+	 * registered. As the driver uses PROBE_FORCE_SYNCHRONOUS, such probes
+	 * always complete before platform_driver_register() or
+	 * platform_device_register_data() return, and therefore before the
+	 * respective flag is cleared again. (This also means that an explicit
+	 * bind that races with either registration is refused.)
+	 *
+	 * The flags may be cleared concurrently by another CPU, without
+	 * holding this device's device_lock, hence the READ_ONCE()s.
+	 */
+	if (efivars_pstore_disable &&
+	    (READ_ONCE(efi_pstore_driver_registering) ||
+	     READ_ONCE(pdata->registering)))
+		return -ENODEV;
 
 	/*
 	 * Notice that 1024 is the minimum here to prevent issues with
@@ -278,24 +283,58 @@ static int efivars_pstore_init(void)
 
 	efi_pstore_info.bufsize = record_size;
 
-	if (pstore_register(&efi_pstore_info)) {
+	ret = pstore_register(&efi_pstore_info);
+	if (ret) {
 		kfree(efi_pstore_info.buf);
 		efi_pstore_info.buf = NULL;
 		efi_pstore_info.bufsize = 0;
 	}
 
-	return 0;
+	return ret;
 }
 
-static void efivars_pstore_exit(void)
+static void efi_pstore_remove(struct platform_device *pdev)
 {
-	if (!efi_pstore_info.bufsize)
-		return;
-
 	pstore_unregister(&efi_pstore_info);
 	kfree(efi_pstore_info.buf);
 	efi_pstore_info.buf = NULL;
 	efi_pstore_info.bufsize = 0;
+}
+
+static const struct platform_device_id efi_pstore_ids[] = {
+	{ .name = EFIVARS_PDEV_NAME, },
+	{ }
+};
+MODULE_DEVICE_TABLE(platform, efi_pstore_ids);
+
+static struct platform_driver efi_pstore_driver = {
+	.probe		= efi_pstore_probe,
+	.remove		= efi_pstore_remove,
+	.id_table	= efi_pstore_ids,
+	.driver		= {
+		.name		= "efi-pstore",
+		.probe_type	= PROBE_FORCE_SYNCHRONOUS,
+	},
+};
+
+static __init int efivars_pstore_init(void)
+{
+	int ret;
+
+	/*
+	 * efi_pstore_driver becomes visible on the platform bus and in sysfs
+	 * before platform_driver_register() returns, so a concurrent probe on
+	 * another CPU may read the flag while it is being cleared.
+	 */
+	WRITE_ONCE(efi_pstore_driver_registering, true);
+	ret = platform_driver_register(&efi_pstore_driver);
+	WRITE_ONCE(efi_pstore_driver_registering, false);
+	return ret;
+}
+
+static __exit void efivars_pstore_exit(void)
+{
+	platform_driver_unregister(&efi_pstore_driver);
 }
 
 module_init(efivars_pstore_init);
@@ -303,4 +342,3 @@ module_exit(efivars_pstore_exit);
 
 MODULE_DESCRIPTION("EFI variable backend for pstore");
 MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:efivars");
